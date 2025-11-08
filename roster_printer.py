@@ -3,14 +3,22 @@ import os
 from helper import timespan_to_slot
 from collections import defaultdict
 import pandas as pd
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Alignment, Font, Border, Side
+from openpyxl.utils import get_column_letter
 
 def slot_to_time(slot):
-    """Convert slot number back to time string - kept for internal use only"""
-    # Assuming slots start at 08:00 and each slot is 15 minutes
-    start_time = datetime.strptime("08:00", "%H:%M")
+    """Convert slot number back to time string (00:00 base, 15-min slots)."""
+    # Start from midnight so slot 40 => 10:00 (40*15 = 600 minutes)
+    start_time = datetime.strptime("00:00", "%H:%M")
     slot_time = start_time + timedelta(minutes=slot * 15)
     return slot_time.strftime("%H:%M")
+def to_12h(time_str: str) -> str:
+    """Convert 'HH:MM' (24h) to 'H:MM AM/PM' (12h)."""
+    try:
+        dt = datetime.strptime(time_str, "%H:%M")
+        return dt.strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        return time_str
 
 
 def add_15_minutes(time_str):
@@ -163,7 +171,7 @@ def print_hourly_breakdown(roster, current_day, store_hours):
 
             # Department work
             dept_work = []
-            for dept in ["HH", "L", "M", "H&B"]:
+            for dept in ["HH", "L's", "M's", "H&B"]:
                 if roster[slot][dept]:
                     dept_work.append(
                         f"{dept}: {', '.join(roster[slot][dept])}")
@@ -288,12 +296,18 @@ def export_roster_to_excel(roster, current_day, working_employees, filename=None
     # Ensure path points into roster_output
     filepath = os.path.join(output_dir, filename)
 
-    # Prepare employee schedules
-    slots = sorted(roster.keys())
+    # Prepare employee schedules with 1-hour buffers before opening and after closing
+    original_slots = sorted(roster.keys())
+    open_start_slot = min(original_slots) if original_slots else 0
+    open_end_slot = max(original_slots) if original_slots else 0
+    buffer_slots = 4  # 1 hour = 4 slots of 15 minutes
+    start_with_buffer = max(0, open_start_slot - buffer_slots)
+    end_with_buffer = open_end_slot + buffer_slots
+    slots = list(range(start_with_buffer, end_with_buffer + 1))
     employee_schedules = {emp: {slot: "" for slot in slots}
                           for emp in working_employees.keys()}
 
-    for slot in slots:
+    for slot in original_slots:
         for task_or_dept, employees in roster[slot].items():
             for emp in employees:
                 if emp in employee_schedules:
@@ -315,79 +329,216 @@ def export_roster_to_excel(roster, current_day, working_employees, filename=None
     time_columns = {slot: f"{slot}" for slot in slots}
     df = df.rename(columns=time_columns)
 
-    # Add department and shift
-    dept_info, shift_info = [], []
+    # Add First Name, Dept, Start, Finish columns
+    first_names, dept_info, start_info, finish_info = [], [], [], []
     for emp in df.index:
+        first_names.append(emp)
         if emp in working_employees:
-            dept_info.append(working_employees[emp]["department"])
-            shift_info.append(f"Shift {working_employees[emp]['shift']}")
+            dept_info.append(working_employees[emp]["department"]) 
+            start_info.append(to_12h(working_employees[emp]["shift"][0]))
+            finish_info.append(to_12h(working_employees[emp]["shift"][1]))
         else:
             dept_info.append("")
-            shift_info.append("")
-    df.insert(0, "Department", dept_info)
-    df.insert(1, "Shift", shift_info)
+            start_info.append("")
+            finish_info.append("")
+    df.insert(0, "First Name", first_names)
+    df.insert(1, "Dept", dept_info)
+    df.insert(2, "Start", start_info)
+    df.insert(3, "Finish", finish_info)
 
-    # Define colors for tasks and departments
+    # Define colors for tasks and departments (RGB hex without '#')
     color_map = {
-        # Tasks
-        "FR": "FFC7CE",      # Fitting Room - light red
-        "GR": "C6EFCE",      # Greeter - light green
-        "R": "FFEB9C",       # Register - light yellow
-        "40": "D9D9D9",      # Break - gray
-        "10": "D9D9D9",
-        "H": "BDD7EE",  # Hurdle/Setup - light blue
         # Departments
-        "CS": "FFE4B5",      # Customer Service - light orange
-        "FR Dept": "D8BFD8",  # Example, can add more
-        "GR Dept": "ADD8E6",
-        # Shift
-        "Shift 0": "FFFFFF",  # optional: white
-        "Shift 1": "F0F8FF"
+        "M's": "DAF2D0",        # Mens (incl. M's inner)
+        "L's": "B5E6A2",        # Ladies (incl. W's inner)
+        "K": "8ED973",          # Kids
+        "M/K": "47D359",        # Mens + Kids
+        "Acc.": "C1F0C8",       # Accessories
+        "Fab": "DAE9F8",        # Fabric
+        "Fab.": "DAE9F8",       # Fabric (alt label)
+        "HW": "A6C9EC",         # Homewear
+        "Stat.": "83CCEB",      # Stationery
+        "H&B": "44B3E1",        # Health & Beauty
+        "HH": "4D93D9",         # Household
+        "F": "FBE2D5",          # Food
+        # Tasks
+        "40": "D9D9D9",         # 40min break
+        "15": "D9D9D9",         # 15min break
+        "10": "D9D9D9",         # 10min break
+        "R": "BE5014",          # Register
+        "FR": "F1A983",         # Fitting room
+        "LD": "FFC000",         # Leader
+        "GR": "F7C7AC",         # Greeter
+        "H": "074F69"           # H
     }
 
     try:
         with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
             df.to_excel(
-                writer, sheet_name=f'{current_day}_Schedule', index=True, index_label='Employee')
+                writer, sheet_name=f'{current_day}_Schedule', index=False)
             worksheet = writer.sheets[f'{current_day}_Schedule']
 
-            # Auto-adjust column widths
-            for column in worksheet.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-                worksheet.column_dimensions[column_letter].width = min(
-                    max_length + 2, 30)
+            # Insert hour header row above the existing header to show grouped hours
+            worksheet.insert_rows(1)
+            first_time_col = 5  # A:First Name, B:Dept, C:Start, D:Finish, E: first slot
+            # Populate minute row (row 2) as 00, 15, 30, 45 and hour row (row 1) with merged headers
+            for i, slot in enumerate(slots):
+                col_idx = first_time_col + i
+                time_str = slot_to_time(slot)  # e.g. "10:15"
+                hour_str, minute_str = time_str.split(":")
+                # Set minute on row 2
+                worksheet.cell(row=2, column=col_idx).value = minute_str
+                # If this is the first quarter of the hour, write and merge the hour label across 4 columns
+                if minute_str == "00":
+                    worksheet.cell(row=1, column=col_idx).value = str(int(hour_str))
+                    end_col = min(col_idx + 3, worksheet.max_column)
+                    worksheet.merge_cells(start_row=1, start_column=col_idx, end_row=1, end_column=end_col)
+            # Center align header rows
+            for i, slot in enumerate(slots):
+                col_idx = first_time_col + i
+                worksheet.cell(row=1, column=col_idx).alignment = Alignment(horizontal="center", vertical="center")
+                worksheet.cell(row=2, column=col_idx).alignment = Alignment(horizontal="center", vertical="center")
+                # Header vertical borders matching body (thinner)
+                is_hour_start = (slot % 4 == 0)
+                left_side = Side(style="thin", color="000000") if is_hour_start else Side(style="hair", color="808080")
+                for header_row in (1, 2):
+                    hc = worksheet.cell(row=header_row, column=col_idx)
+                    hb = hc.border
+                    hc.border = Border(left=left_side, right=hb.right, top=hb.top, bottom=hb.bottom)
 
-            # Apply colors to all cells
-            # start from column 2 (Department)
-            for row in worksheet.iter_rows(min_row=2, min_col=2):
+            # Set consistent column widths
+            # A: First Name, B: Dept, C: Start, D: Finish
+            worksheet.column_dimensions[get_column_letter(1)].width = 7
+            worksheet.column_dimensions[get_column_letter(2)].width = 7
+            worksheet.column_dimensions[get_column_letter(3)].width = 7
+            worksheet.column_dimensions[get_column_letter(4)].width = 7
+            for i, _ in enumerate(slots):
+                col_idx = first_time_col + i
+                worksheet.column_dimensions[get_column_letter(col_idx)].width = 3
+
+            # Add vertical borders for time columns: thin black at hour start, hair grey at minutes
+            thin_grey = Side(style="hair", color="808080")
+            black_hour = Side(style="thin", color="000000")
+            max_row = worksheet.max_row
+            for i, slot in enumerate(slots):
+                col_idx = first_time_col + i
+                is_hour_start = (slot % 4 == 0)
+                left_side = black_hour if is_hour_start else thin_grey
+                for row_idx in range(1, max_row + 1):
+                    c = worksheet.cell(row=row_idx, column=col_idx)
+                    b = c.border
+                    c.border = Border(
+                        left=left_side,
+                        right=b.right,
+                        top=b.top,
+                        bottom=b.bottom
+                    )
+            # Ensure a black right border at the end of the last time column
+            last_time_col = first_time_col + len(slots) - 1
+            for row_idx in range(1, max_row + 1):
+                c = worksheet.cell(row=row_idx, column=last_time_col)
+                b = c.border
+                c.border = Border(
+                    left=b.left,
+                    right=black_hour,
+                    top=b.top,
+                    bottom=b.bottom
+                )
+
+            # Intentionally skip auto-fit here to preserve fixed widths (time=3, metadata=7)
+
+            # Apply colors to all cells (including metadata and time slots)
+            # Data now starts at row 3 because we inserted a header row
+            for row in worksheet.iter_rows(min_row=3, min_col=1):
                 for cell in row:
-                    if cell.value:
+                    if cell.value is not None and str(cell.value).strip() != "":
                         # If multiple tasks, pick first for coloring
                         first_value = str(cell.value).split(" + ")[0]
-                        fill_color = color_map.get(
-                            first_value, "FFFFFF")  # default white
+                        fill_color = color_map.get(first_value, "FFFFFF")
                         cell.fill = PatternFill(start_color=fill_color,
                                                 end_color=fill_color,
                                                 fill_type="solid")
+                    # Center align all cells
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    # Set font to Arial 8 for all cells
+                    cell.font = Font(name="Arial", size=8)
 
-            # Also color the Employee index column (optional)
-            for row_idx, emp in enumerate(df.index, start=2):
-                cell = worksheet.cell(row=row_idx, column=1)
+            # Color the Dept column based on department
+            for row_idx, emp in enumerate(list(df["First Name"]), start=3):
+                cell = worksheet.cell(row=row_idx, column=2)
                 dept = working_employees.get(emp, {}).get("department", "")
+                # Normalize department keys to match color map
+                if dept == "M":
+                    dept = "M's"
+                elif dept == "L":
+                    dept = "L's"
+                elif dept == "Acc":
+                    dept = "Acc."
+                elif dept == "Stat":
+                    dept = "Stat."
                 fill_color = color_map.get(dept, "FFFFFF")
                 cell.fill = PatternFill(start_color=fill_color,
                                         end_color=fill_color,
                                         fill_type="solid")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.font = Font(name="Arial", size=8)
 
-            # Create summary sheet if needed
-            create_summary_sheet(writer, roster, current_day, slots)
+            # Grey out pre-opening buffer; after closing buffer show dept if employee still working
+            for row_idx, emp in enumerate(list(df["First Name"]), start=3):
+                emp_info = working_employees.get(emp, {})
+                emp_slots = []
+                if emp_info and emp_info.get("shift"):
+                    try:
+                        emp_slots = list(timespan_to_slot(emp_info["shift"]))
+                    except Exception:
+                        emp_slots = []
+                for i, slot in enumerate(slots):
+                    col_idx = first_time_col + i
+                    cell = worksheet.cell(row=row_idx, column=col_idx)
+                    if slot < open_start_slot:
+                        # Pre-opening buffer always grey
+                        cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+                        cell.value = cell.value  # keep any value blank
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                        cell.font = Font(name="Arial", size=8)
+                    elif slot > open_end_slot:
+                        if slot in emp_slots:
+                            # After-closing buffer: if still working, show department
+                            dept = working_employees.get(emp, {}).get("department", "")
+                            if dept == "M":
+                                dept = "M's"
+                            elif dept == "L":
+                                dept = "L's"
+                            elif dept == "Acc":
+                                dept = "Acc."
+                            elif dept == "Stat":
+                                dept = "Stat."
+                            cell.value = dept
+                            fill_color = color_map.get(dept, "FFFFFF")
+                            cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
+                        else:
+                            # Not working: grey
+                            cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                        cell.font = Font(name="Arial", size=8)
+                    else:
+                        # Within store hours: if outside employee shift and empty, grey
+                        if slot not in emp_slots and (cell.value is None or str(cell.value).strip() == ""):
+                            cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+                            cell.alignment = Alignment(horizontal="center", vertical="center")
+                            cell.font = Font(name="Arial", size=8)
+
+            # Re-assert fixed widths at the very end to avoid any later overrides
+            worksheet.column_dimensions[get_column_letter(1)].width = 12
+            worksheet.column_dimensions[get_column_letter(2)].width = 7
+            worksheet.column_dimensions[get_column_letter(3)].width = 7
+            worksheet.column_dimensions[get_column_letter(4)].width = 7
+            for i, _ in enumerate(slots):
+                col_idx = first_time_col + i
+                worksheet.column_dimensions[get_column_letter(col_idx)].width = 4
+
+            # Create summary sheet using original store-open slots (exclude buffers)
+            create_summary_sheet(writer, roster, current_day, original_slots)
 
         print(f"✅ Roster exported to: {filepath}")
         return filepath
@@ -415,8 +566,8 @@ def create_summary_sheet(writer, roster, current_day, slots):
 
         # Department coverage
         slot_summary["Home & Hardware"] = len(roster[slot].get("HH", []))
-        slot_summary["Ladies"] = len(roster[slot].get("L", []))
-        slot_summary["Mens"] = len(roster[slot].get("M", []))
+        slot_summary["Ladies"] = len(roster[slot].get("L's", []))
+        slot_summary["Mens"] = len(roster[slot].get("M's", []))
         slot_summary["Health & Beauty"] = len(roster[slot].get("H&B", []))
 
         # Total employees working
@@ -438,7 +589,7 @@ def create_summary_sheet(writer, roster, current_day, slots):
     # Format the summary sheet
     summary_worksheet = writer.sheets[f'{current_day}_Summary']
 
-    # Auto-adjust column widths
+    # Auto-adjust column widths and center align all cells
     for column in summary_worksheet.columns:
         max_length = 0
         column_letter = column[0].column_letter
@@ -448,5 +599,6 @@ def create_summary_sheet(writer, roster, current_day, slots):
                     max_length = len(str(cell.value))
             except:
                 pass
+            cell.alignment = Alignment(horizontal="center", vertical="center")
         adjusted_width = max_length + 2
         summary_worksheet.column_dimensions[column_letter].width = adjusted_width
